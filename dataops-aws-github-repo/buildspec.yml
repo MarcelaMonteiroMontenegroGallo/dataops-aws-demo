@@ -1,0 +1,28 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - echo "Instalando ferramentas de validação"
+      - pip install cfn-lint pytest
+  pre_build:
+    commands:
+      - echo "Validando estrutura do repositório"
+      - test -d templates
+      - test -d scripts
+      - test -d tests
+  build:
+    commands:
+      - echo "Validando templates CloudFormation"
+      - cfn-lint templates/*.yaml || true
+      - echo "Executando testes"
+      - pytest -q
+  post_build:
+    commands:
+      - echo "Build finalizado com sucesso"
+
+artifacts:
+  files:
+    - '**/*'

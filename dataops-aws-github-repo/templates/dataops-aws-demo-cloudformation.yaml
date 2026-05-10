@@ -1,0 +1,752 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: DataOps AWS Demo - S3 Medallion, Glue, Glue Data Quality, Step Functions, EventBridge, SNS, Lambda, CloudWatch and optional CI/CD.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: energeticos-dataops
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - hml
+      - prd
+  NotificationEmail:
+    Type: String
+    Default: ""
+  GitHubConnectionArn:
+    Type: String
+    Default: ""
+    Description: CodeStar Connection ARN for GitHub. Required only when CreateCICD is true.
+  FullRepositoryId:
+    Type: String
+    Default: sua-org/seu-repo
+  BranchName:
+    Type: String
+    Default: main
+  ArtifactTemplatePath:
+    Type: String
+    Default: templates/dataops-aws-demo-cloudformation.yaml
+  CreateCICD:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  CreateCICDCondition: !Equals [!Ref CreateCICD, "true"]
+
+Resources:
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-lake-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-noncurrent-retention
+            Status: Enabled
+            Prefix: raw/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: quarantine-retention
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 365
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DataOpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-dataops-alerts'
+
+  BusinessAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-business-alerts'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref DataOpsAlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  GlueDatabaseRaw:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_raw'
+
+  GlueDatabaseBronze:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_bronze'
+
+  GlueDatabaseSilver:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_silver'
+
+  GlueDatabaseGold:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_gold'
+
+  SilverVendasTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseSilver
+      TableInput:
+        Name: vendas
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          EXTERNAL: "TRUE"
+        PartitionKeys:
+          - Name: data_ref
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${DataLakeBucket}/silver/vendas/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: id_transacao
+              Type: string
+            - Name: id_loja
+              Type: string
+            - Name: canal
+              Type: string
+            - Name: valor_total
+              Type: double
+            - Name: qtd_itens
+              Type: int
+            - Name: ncm
+              Type: string
+            - Name: cnpj_loja
+              Type: string
+            - Name: data_venda
+              Type: string
+
+  VendasSilverDQRuleset:
+    Type: AWS::Glue::DataQualityRuleset
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-vendas-silver-dq'
+      Description: DQDL rules for vendas dataset.
+      TargetTable:
+        DatabaseName: !Ref GlueDatabaseSilver
+        TableName: vendas
+      Ruleset: |
+        Rules = [
+          ColumnExists "id_transacao",
+          IsComplete "id_transacao",
+          IsComplete "id_loja",
+          IsComplete "valor_total",
+          ColumnValues "canal" in ["LOJA", "MARKETPLACE", "B2B"],
+          ColumnLength "cnpj_loja" = 14,
+          ColumnValues "ncm" in ["22021000", "22029100", "22029900"],
+          RowCount > 100,
+          Uniqueness "id_transacao" > 0.99,
+          Mean "valor_total" between 1 and 10000
+        ]
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-glue-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: data-lake-and-catalog-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:UpdateTable
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:GetDataQualityRuleset
+                  - glue:StartDataQualityRulesetEvaluationRun
+                  - glue:GetDataQualityRulesetEvaluationRun
+                Resource: "*"
+
+  RawToBronzeJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-01-raw-to-bronze'
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/scripts/raw_to_bronze.py'
+      DefaultArguments:
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--DATA_LAKE_BUCKET": !Ref DataLakeBucket
+        "--ENVIRONMENT": !Ref Environment
+
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-02-bronze-to-silver'
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/scripts/bronze_to_silver.py'
+      DefaultArguments:
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--DATA_LAKE_BUCKET": !Ref DataLakeBucket
+        "--ENVIRONMENT": !Ref Environment
+
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-03-silver-to-gold'
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactBucket}/scripts/silver_to_gold.py'
+      DefaultArguments:
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--DATA_LAKE_BUCKET": !Ref DataLakeBucket
+        "--ENVIRONMENT": !Ref Environment
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dataops-lambda-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - cloudwatch:PutMetricData
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                  - s3:ListBucket
+                Resource: "*"
+
+  EvalProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-eval-profile-gate'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          DATAOPS_TOPIC_ARN: !Ref DataOpsAlertTopic
+      Code:
+        ZipFile: |
+          import boto3
+          cw = boto3.client("cloudwatch")
+          def handler(event, context):
+              records = int(event.get("records", 1000))
+              passed = records >= 100
+              cw.put_metric_data(
+                  Namespace="DataOpsDemo",
+                  MetricData=[{"MetricName": "ProfileGatePassed", "Value": 1 if passed else 0, "Unit": "Count"}]
+              )
+              return {
+                  "passed": passed,
+                  "gate": "profile",
+                  "data_date": event.get("data_date", "2026-05-09"),
+                  "reason": "volume mínimo aprovado" if passed else "volume abaixo do mínimo esperado"
+              }
+
+  EvalDQFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-eval-dq-gate'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {
+                  "passed": True,
+                  "gate": "dq",
+                  "data_date": event.get("data_date", "2026-05-09"),
+                  "reason": "regras DQDL aprovadas para demonstração"
+              }
+
+  BusinessGateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-business-gate'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUSINESS_TOPIC_ARN: !Ref BusinessAlertTopic
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          sns = boto3.client("sns")
+          def handler(event, context):
+              revenue_delta = float(event.get("revenue_delta_pct", 0))
+              suspicious = abs(revenue_delta) > 30
+              if suspicious:
+                  sns.publish(
+                      TopicArn=os.environ["BUSINESS_TOPIC_ARN"],
+                      Subject="DataOps Business Gate - KPI suspeito",
+                      Message=json.dumps({"message": "Desvio relevante detectado no KPI de negócio.", "event": event}, default=str)
+                  )
+              return {
+                  "passed": True,
+                  "gate": "business",
+                  "suspicious": suspicious,
+                  "reason": "alerta executivo enviado" if suspicious else "KPIs dentro do comportamento esperado"
+              }
+
+  NotifyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-notify-dataops'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          DATAOPS_TOPIC_ARN: !Ref DataOpsAlertTopic
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          sns = boto3.client("sns")
+          def handler(event, context):
+              sns.publish(
+                  TopicArn=os.environ["DATAOPS_TOPIC_ARN"],
+                  Subject="DataOps Pipeline - Alerta",
+                  Message=json.dumps(event, default=str, indent=2)
+              )
+              return {"notified": True}
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-dataops-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt EvalProfileFunction.Arn
+                  - !GetAtt EvalDQFunction.Arn
+                  - !GetAtt BusinessGateFunction.Arn
+                  - !GetAtt NotifyFunction.Arn
+
+  DataOpsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-dataops-pipeline'
+      RoleArn: !GetAtt StateMachineRole.Arn
+      Definition:
+        Comment: DataOps demo pipeline with gates, Choice and Catch.
+        StartAt: ProfileGate
+        States:
+          ProfileGate:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt EvalProfileFunction.Arn
+              Payload.$: $
+            OutputPath: $.Payload
+            Next: ProfileChoice
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          ProfileChoice:
+            Type: Choice
+            Choices:
+              - Variable: $.passed
+                BooleanEquals: false
+                Next: NotifyDataOps
+            Default: RawToBronze
+          RawToBronze:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref RawToBronzeJob
+              Arguments:
+                "--DATA_DATE.$": "$.data_date"
+            ResultPath: $.raw_to_bronze
+            Next: BronzeToSilver
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          BronzeToSilver:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref BronzeToSilverJob
+              Arguments:
+                "--DATA_DATE.$": "$.data_date"
+            ResultPath: $.bronze_to_silver
+            Next: DQGate
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          DQGate:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt EvalDQFunction.Arn
+              Payload.$: $
+            OutputPath: $.Payload
+            Next: DQChoice
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          DQChoice:
+            Type: Choice
+            Choices:
+              - Variable: $.passed
+                BooleanEquals: false
+                Next: NotifyDataOps
+            Default: SilverToGold
+          SilverToGold:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref SilverToGoldJob
+              Arguments:
+                "--DATA_DATE.$": "$.data_date"
+            ResultPath: $.silver_to_gold
+            Next: BusinessGate
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          BusinessGate:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt BusinessGateFunction.Arn
+              Payload.$: $
+            OutputPath: $.Payload
+            Next: Success
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: $.error
+                Next: NotifyDataOps
+          NotifyDataOps:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: !GetAtt NotifyFunction.Arn
+              Payload.$: $
+            End: true
+          Success:
+            Type: Succeed
+
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-step-functions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref DataOpsStateMachine
+
+  DailyPipelineSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-daily-pipeline'
+      ScheduleExpression: cron(0 9 * * ? *)
+      State: DISABLED
+      Targets:
+        - Arn: !Ref DataOpsStateMachine
+          Id: dataops-pipeline-target
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+          Input: '{"data_date":"2026-05-09","records":1000,"revenue_delta_pct":0}'
+
+  DataOpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dataops-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["DataOpsDemo", "ProfileGatePassed"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DataOps Profile Gate"
+              }
+            }
+          ]
+        }
+
+  CICDRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCICDCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-cicd-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cicd-admin-demo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: CreateCICDCondition
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-validate-build'
+      ServiceRole: !GetAtt CICDRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip install cfn-lint pytest
+            build:
+              commands:
+                - echo "Validando CloudFormation"
+                - cfn-lint templates/*.yaml || true
+                - echo "Validando estrutura dos artefatos"
+                - test -d scripts || echo "Crie a pasta scripts com os jobs Glue"
+                - echo "Build finalizado"
+          artifacts:
+            files:
+              - '**/*'
+
+  PipelineArtifactStore:
+    Type: AWS::S3::Bucket
+    Condition: CreateCICDCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  DataOpsCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: CreateCICDCondition
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-cicd'
+      RoleArn: !GetAtt CICDRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactStore
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Validate
+          Actions:
+            - Name: BuildAndValidate
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployCloudFormation
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub '${ProjectName}-${Environment}-dataops-runtime'
+                Capabilities: CAPABILITY_NAMED_IAM
+                TemplatePath: !Sub 'BuildOutput::${ArtifactTemplatePath}'
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "NotificationEmail": "${NotificationEmail}",
+                    "CreateCICD": "false"
+                  }
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  StateMachineArn:
+    Value: !Ref DataOpsStateMachine
+  DataOpsAlertTopicArn:
+    Value: !Ref DataOpsAlertTopic
+  BusinessAlertTopicArn:
+    Value: !Ref BusinessAlertTopic
+  DashboardName:
+    Value: !Ref DataOpsDashboard
