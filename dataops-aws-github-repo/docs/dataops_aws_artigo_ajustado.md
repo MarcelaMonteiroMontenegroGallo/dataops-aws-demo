@@ -296,9 +296,6 @@ EventPattern:
 ```
 
 
-
-*Detalhe de um commit: autoria, mensagem ("feat: adiciona quality gates DQDL e testes unitarios") e ID. O evento referenceUpdated dispara o pipeline.*
-
 ### Testes com dados sintéticos
 
 O segredo do CI/CD para dados é ter datasets de teste que representem cenários reais. Na Energéticos, o time mantém 4 datasets sintéticos:
