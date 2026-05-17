@@ -156,11 +156,7 @@ A abordagem declarativa do DQDL traz três benefícios diretos. Primeiro, as reg
 
 Na Energéticos, o time de qualidade industrial define as regras de negócio em linguagem natural. O engenheiro de dados traduz para DQDL. Ambos revisam juntos. Esse processo colaborativo eliminou 80% dos falsos positivos que existiam quando as regras eram hardcoded em scripts Python.
 
-Vale conhecer os limites do serviço para dimensionar bem: um ruleset suporta até 2.000 regras e tem tamanho máximo de 65 KB — rulesets maiores devem ser divididos. As estatísticas coletadas têm limite de 100.000 por conta e retenção de até dois anos. Em custo, o Glue Data Quality cobra por DPU consumido durante a avaliação, na mesma tarifa de um Glue Job equivalente (na ordem de US$ 0,44 por DPU-hora), e a detecção de anomalias consome aproximadamente 1 DPU por estatística analisada — um motivo para habilitar anomaly detection apenas em tabelas de alto valor.
-
-<img width="1094" height="782" alt="image" src="https://github.com/user-attachments/assets/472e3b60-34c8-42f9-9da4-fd1187104786" />
-
-*Regras DQDL avaliadas no pipeline da Energéticos. O score de qualidade alimenta o estado Choice do Step Functions.*
+Vale conhecer os limites do serviço para dimensionar bem: um ruleset suporta até 2.000 regras e tem tamanho máximo de 65 KB, rulesets maiores devem ser divididos. As estatísticas coletadas têm limite de 100.000 por conta e retenção de até dois anos. Em custo, o Glue Data Quality cobra por DPU consumido durante a avaliação, na mesma tarifa de um Glue Job equivalente (na ordem de US$ 0,44 por DPU-hora), e a detecção de anomalias consome aproximadamente 1 DPU por estatística analisada — um motivo para habilitar anomaly detection apenas em tabelas de alto valor.
 
 ## CI/CD para Pipelines de Dados
 
@@ -192,14 +188,15 @@ pipeline-energeticos/
     test_quality_rules.py
 ```
 
-![Repositório CodeCommit com o template do pipeline DataOps](img/09-codecommit-main.png)
+<img width="715" height="244" alt="codecommitmain" src="https://github.com/user-attachments/assets/64f449f1-745f-4ed9-8c68-730670075b96" />
+
 *Branch `main` do repositório, com o template versionado. Cada push dispara o pipeline de CI/CD.*
 
 > **Nota sobre o repositório de código.** Esta implementação usa AWS CodeCommit como repositório Git. É importante o contexto: em julho de 2024 a AWS deixou de aceitar novos clientes no CodeCommit, recomendando GitHub, GitLab ou outros provedores. Em novembro de 2025, após retorno de feedback de clientes — especialmente de setores regulados que valorizam a integração nativa com IAM, VPC endpoints e CloudTrail —, a AWS reverteu a decisão e o CodeCommit voltou à disponibilidade geral completa, com inscrições de novos clientes reabertas. Para times que preferem outro provedor, todo o fluxo descrito aqui funciona de forma equivalente com **AWS CodeConnections** (antiga CodeStar Connections) integrando GitHub ou GitLab ao CodePipeline — a arquitetura de CI/CD não muda, apenas a origem do código.
 
 ### Arquitetura CI/CD Cross-Region
 
-O pipeline de CI/CD da Energéticos opera cross-region: o código vive em us-east-1 (desenvolvimento) e o deploy de produção acontece em sa-east-1 (São Paulo, mais próximo das plantas industriais). Essa separação garante que o ambiente de desenvolvimento nunca interfira na produção, e que os dados de produção fiquem na região com menor latência para os consumidores.
+O pipeline de CI/CD da Energéticos opera cross-region nessa demo(em projetos produtivos cada ambiente deverá ter sua conta separada): o código vive em us-east-1 (desenvolvimento) e o deploy de produção acontece em sa-east-1 (São Paulo, mais próximo das plantas industriais),. Essa separação garante que o ambiente de desenvolvimento nunca interfira na produção, e que os dados de produção fiquem na região com menor latência para os consumidores.
 
 > **Nota:** A fim de demonstração, utilizamos duas regiões distintas (us-east-1 e sa-east-1) para simular o cenário cross-region. Em produção, a escolha de regiões depende dos requisitos de latência, compliance e disaster recovery de cada organização.
 
@@ -265,10 +262,14 @@ phases:
 
 O `--no-fail-on-empty-changeset` é importante: se o template não mudou, o pipeline não falha — simplesmente reporta que não há alterações. Isso evita falsos negativos quando apenas scripts Glue são atualizados sem mudança na infraestrutura.
 
-![Fases do build no AWS CodeBuild](img/11-codebuild-fases.png)
+
+<img width="1700" height="740" alt="codebuild" src="https://github.com/user-attachments/assets/23af2160-375e-45c4-839b-9228eb920795" />
+
 *As 11 fases do CodeBuild, de SUBMITTED a COMPLETED, todas com status "Com êxito". A fase BUILD executa o deploy cross-region.*
 
-![Log do CodeBuild confirmando o deploy cross-region](img/12-codebuild-log.png)
+
+<img width="1277" height="758" alt="Cloudformation" src="https://github.com/user-attachments/assets/dfde89e0-f9e6-454a-8377-3aec96bba364" />
+
 *Log de execução: o template é validado, o deploy cross-region é aplicado e o stack chega a UPDATE_COMPLETE.*
 
 ### IAM Cross-Region: o desafio real
@@ -294,7 +295,8 @@ EventPattern:
     referenceName: [main]
 ```
 
-![Commit registrado no CodeCommit](img/10-codecommit-commit.png)
+
+
 *Detalhe de um commit: autoria, mensagem ("feat: adiciona quality gates DQDL e testes unitarios") e ID. O evento referenceUpdated dispara o pipeline.*
 
 ### Testes com dados sintéticos
@@ -310,8 +312,8 @@ O segredo do CI/CD para dados é ter datasets de teste que representem cenários
 
 Cada push no repositório executa a suíte de testes contra esses datasets. Se qualquer quality gate rejeitar dados do happy_path ou aceitar dados do outliers, o pipeline de CI/CD falha e o merge é bloqueado. A suíte usa pytest com a biblioteca hypothesis para property-based testing — em vez de só verificar exemplos fixos, ela gera variações dos dados e confirma que as invariantes do pipeline se mantêm.
 
-![Execução da suíte de testes unitários](img/13-testes-unitarios.png)
-*32 testes cobrindo os 4 quality gates (ingestão, conformidade, consistência, entrega) e as transformações Raw→Bronze→Silver→Gold. Todos aprovados antes do deploy.*
+<img width="709" height="332" alt="teste unitario" src="https://github.com/user-attachments/assets/96635036-c406-473d-9da5-838b44b06562" />
+
 
 ## Orquestração com Step Functions: Choice e Catch
 
@@ -363,10 +365,10 @@ Cada estado do Step Functions tem um bloco Catch que captura erros específicos 
 
 O poder real aparece quando Choice e Catch trabalham juntos. O Choice lida com decisões de negócio (qualidade suficiente ou não). O Catch lida com falhas técnicas (timeout, exceção, serviço indisponível). Juntos, cobrem tanto o cenário "dados ruins" quanto o cenário "infraestrutura com problema".
 
-![Step Functions com Choice e Catch em execução](img/05-stepfunctions-pipeline.png)
+<img width="1123" height="655" alt="image" src="https://github.com/user-attachments/assets/0a529712-7a86-442e-8bf3-90d6900564da" />
+
 *Máquina de estados em execução: o estado StartGlueJob conclui com sucesso (verde), o Catch #1 protege contra falhas roteando para NotifyFailure, e o fluxo chega a JobSucceeded.*
 
-Na prática, a Energéticos tem um Step Functions com 14 estados: 4 Glue Jobs (um por camada), 4 Quality Gates, 3 estados Choice (gates 2, 3 e 4), 2 estados de tratamento de falha e 1 estado final de notificação de sucesso.
 
 ## Observabilidade em 3 Planos
 
@@ -412,7 +414,10 @@ O plano de dados monitora a qualidade e o comportamento dos dados em si. As perg
 
 Os três planos convergem em um dashboard CloudWatch que a equipe da Energéticos consulta diariamente. O dashboard agrega métricas de Step Functions (execuções e duração), Glue Job (tasks completadas vs falhas, bytes lidos e records escritos), SNS (notificações publicadas e entregues) e um painel de Quality Gate que resume o score de qualidade contra o threshold definido.
 
-![Dashboard CloudWatch unificado do pipeline DataOps](img/14-cloudwatch-dashboard.png)
+<img width="1894" height="827" alt="image" src="https://github.com/user-attachments/assets/a4fd68c3-ccd2-4e8f-8789-130d23473c8d" />
+
+
+
 *Dashboard DataOps-Pipeline-Monitor: execuções e duração do Step Functions, métricas do Glue Job, notificações SNS e o painel Quality Gate com o resumo do score.*
 
 O time configurou alarmes compostos (Composite Alarms) que correlacionam métricas dos três planos. Por exemplo: se o volume de dados cai E o Glue Job está com duração normal E não há erros de infraestrutura, o problema provavelmente está na fonte. Essa correlação reduz o tempo de diagnóstico de 45 minutos para menos de 5.
@@ -421,7 +426,9 @@ O time configurou alarmes compostos (Composite Alarms) que correlacionam métric
 
 O Amazon SNS distribui as notificações do pipeline. O modelo de publish/subscribe permite que um único evento — um quality gate que falhou, um Glue Job que estourou timeout — seja entregue simultaneamente a múltiplos endpoints: e-mail da equipe de plantão, um endpoint HTTPS que registra o incidente, e potencialmente SMS para incidentes críticos. O publisher (o estado NotifyFailure do Step Functions) não conhece os subscribers; essa indireção é o que torna o sistema de alertas extensível sem mexer no pipeline.
 
-![Tópico SNS com a assinatura de e-mail confirmada](img/06-sns-topic.png)
+
+<img width="1542" height="518" alt="topico" src="https://github.com/user-attachments/assets/de384cbc-3bac-4cdc-b67d-44f2f937d6eb" />
+
 *Tópico `dataops-demo-dev-pipeline-alerts` com assinatura de e-mail confirmada. Cada alerta carrega o contexto do incidente.*
 
 ## Processo de Quarentena
@@ -430,7 +437,8 @@ Quarentena é o mecanismo que isola dados problemáticos sem interromper o pipel
 
 A separação física das camadas — raw, processed (bronze/silver/gold) e quarentena em buckets distintos — é uma decisão arquitetural importante: garante que dados problemáticos nunca contaminem fisicamente as camadas downstream, mesmo em caso de erro de código no pipeline.
 
-![Buckets S3 do pipeline DataOps](img/02-s3-buckets.png)
+<img width="1057" height="491" alt="image" src="https://github.com/user-attachments/assets/21144f7f-0ee0-4611-bdf1-91c6c6978083" />
+
 *Os buckets do data lake: raw (ingestão), processed (camadas medallion), scripts, cicd-artifacts e o bucket dedicado de quarentena. A separação física isola cada estágio e impede que dados rejeitados contaminem camadas downstream.*
 
 ### Estrutura da quarentena
@@ -455,7 +463,8 @@ O arquivo de metadados contém informações essenciais para diagnóstico:
     - source_file: arquivo original que gerou os dados
     - pipeline_execution_id: ID da execução do Step Functions
 
-![Estrutura interna do bucket de quarentena](img/16-quarentena-estrutura.png)
+<img width="1627" height="393" alt="image" src="https://github.com/user-attachments/assets/a5191412-7b05-4314-b1ce-2f81f5c0edb0" />
+
 *O bucket de quarentena particionado por gate: `gate=1/` e `gate=2/` isolam as rejeições de cada quality gate, facilitando triagem e reprocessamento direcionado.*
 
 ### Ciclo de vida da quarentena
@@ -468,8 +477,8 @@ Dados em quarentena seguem um ciclo de vida definido com SLAs claros:
 4. Correção: fix aplicado na fonte, no job ou na regra (manual, SLA 24 horas)
 5. Reprocessamento: dados corrigidos são reinjetados no pipeline (semi-automático, < 1 hora)
 6. Expiração: dados não reprocessados em 30 dias são movidos para Glacier (automático, via S3 Lifecycle)
+<img width="1306" height="644" alt="image" src="https://github.com/user-attachments/assets/305ecd6b-ae7e-492f-8a81-fd5daeed16e6" />
 
-![Regra de ciclo de vida do bucket de quarentena](img/15-quarentena-lifecycle.png)
 *Regra S3 Lifecycle `quarentena-glacier-30dias` habilitada: objetos não reprocessados transicionam automaticamente para Glacier Flexible Retrieval no dia 30, reduzindo custo de retenção sem perder os dados para auditoria.*
 
 ### Reprocessamento controlado
@@ -486,10 +495,10 @@ Esse processo garantiu que a Energéticos recuperasse 94% dos dados quarentenado
 
 ## A Infraestrutura como Código
 
-Toda a arquitetura descrita — buckets, Glue Job, Step Functions, SNS, alarmes — é provisionada por um único template CloudFormation. Isso garante reprodutibilidade (o ambiente de produção é idêntico ao de homologação), versionamento (cada mudança de infraestrutura passa pelo mesmo CI/CD do código) e capacidade de auditoria (o diff do template mostra exatamente o que mudou).
+Toda a arquitetura descrita — buckets, Glue Job, Step Functions, SNS, alarmes — é provisionada por dois templates CloudFormation. Isso garante reprodutibilidade (o ambiente de produção é idêntico ao de homologação), versionamento (cada mudança de infraestrutura passa pelo mesmo CI/CD do código) e capacidade de auditoria (o diff do template mostra exatamente o que mudou).
 
-![Recursos do stack CloudFormation](img/01-cfn-stack-resources.png)
-*Os 12 recursos do stack dataops-demo: Step Functions, Glue Database e Job, IAM Roles, CloudWatch Alarm, SNS Topic e Subscription, CodeCommit Repository e os buckets S3.*
+<img width="1144" height="685" alt="image" src="https://github.com/user-attachments/assets/9d198223-31e7-436b-b601-ba8f806b9d48" />
+
 
 O stack é parametrizado por ambiente (`Environment=dev|prod`), o que permite que o mesmo template gere as duas instâncias sem duplicação de código. O deploy de produção, disparado pelo CodeBuild, chega ao estado `UPDATE_COMPLETE` ao final do pipeline de CI/CD.
 
