@@ -92,7 +92,9 @@ DQDL (Data Quality Definition Language) é a linguagem declarativa do AWS Glue D
 
 Na Energéticos, as regras DQDL são avaliadas dentro do próprio Glue Job de ETL: a mesma execução que transforma os dados também aplica os quality gates, evitando uma passada extra de leitura. O job roda em Glue 4.0 (Spark 3.3, Python 3) com a opção de geração de insights habilitada, o que permite ao serviço analisar execuções e sugerir otimizações.
 
-![Glue Job de ETL configurado com Data Quality](img/03-glue-job-details.png)
+
+<img width="1694" height="572" alt="image" src="https://github.com/user-attachments/assets/98f3bbe6-b566-4f0d-b6de-902460a21d4c" />
+
 *O Glue Job `dataops-demo-dev-etl-job` com Data Quality integrado: transformação e avaliação de qualidade na mesma execução, com role IAM dedicada e job insights ativo.*
 
 ### Anatomia de uma regra DQDL
@@ -156,7 +158,8 @@ Na Energéticos, o time de qualidade industrial define as regras de negócio em 
 
 Vale conhecer os limites do serviço para dimensionar bem: um ruleset suporta até 2.000 regras e tem tamanho máximo de 65 KB — rulesets maiores devem ser divididos. As estatísticas coletadas têm limite de 100.000 por conta e retenção de até dois anos. Em custo, o Glue Data Quality cobra por DPU consumido durante a avaliação, na mesma tarifa de um Glue Job equivalente (na ordem de US$ 0,44 por DPU-hora), e a detecção de anomalias consome aproximadamente 1 DPU por estatística analisada — um motivo para habilitar anomaly detection apenas em tabelas de alto valor.
 
-![Regras DQDL configuradas no AWS Glue Data Quality](img/04-dqdl-rules.png)
+<img width="1094" height="782" alt="image" src="https://github.com/user-attachments/assets/472e3b60-34c8-42f9-9da4-fd1187104786" />
+
 *Regras DQDL avaliadas no pipeline da Energéticos. O score de qualidade alimenta o estado Choice do Step Functions.*
 
 ## CI/CD para Pipelines de Dados
