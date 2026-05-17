@@ -1,331 +1,588 @@
-# DataOps na AWS sem fórmula mágica: como a Energéticos/SA virou seu pipeline de varejo de "vai dar certo" para "está sob controle"
+# DataOps na AWS: como aplicar práticas de engenharia ao ciclo de vida dos dados
 
-## Por que esse artigo existe
+**Por Marcela Monteiro Montenegro Gallo**
+*Arquiteta de Dados e AI | 9x AWS Certified | 2x Databricks Certified*
+*Ingram Micro Cloud — AWS Partner*
 
-DataOps virou termo genérico em deck de venda. Em quase todo lugar você lê "DataOps é DevOps para dados", aparece um diagrama com setas saindo de S3, passando por Glue, parando em QuickSight, e nada disso responde à pergunta que importa:
-
-**quando os dados quebram, em que ponto exatamente o time descobre?**
-
-Se a resposta envolve um diretor recebendo print do Power BI no WhatsApp dizendo "isso aqui está estranho", o pipeline não é DataOps. É só ETL com sorte.
-
-DataOps de verdade exige cinco pilares operacionais explícitos:
-
-1. **Qualidade verificável**: testes contra regras de negócio, não apenas schema.
-2. **Observabilidade em três planos**: pipeline, dados e negócio.
-3. **Automação completa**: do ingresso à publicação, sem etapa manual.
-4. **Governança rastreável**: linhagem, versão de schema, auditoria de quem mudou o quê.
-5. **CI/CD completo**: versionamento, validação, testes, promoção entre ambientes e rollback controlado.
-
-Faltando qualquer um deles, você tem ETL antigo com nome novo.
-
-Este artigo apresenta uma implementação de referência de DataOps na AWS para uma empresa de varejo brasileira fictícia, **Energéticos/SA**, usando Amazon S3, AWS Glue, AWS Glue Data Quality, AWS Step Functions, Amazon EventBridge, Amazon SNS, AWS Lambda, Amazon CloudWatch, AWS CodePipeline, AWS CodeBuild e CloudFormation.
-
-A ideia não é vender uma fórmula mágica. É mostrar uma arquitetura operável, auditável e demonstrável.
+*Data de publicação: maio de 2026*
 
 ---
 
-## O caso: Energéticos/SA
+## Introdução
 
-A **Energéticos/SA** é uma rede brasileira fictícia de varejo especializado em bebidas energéticas e funcionais, com 340 pontos de venda em capitais e cidades médias, operação multicanal e áreas de negócio consumindo dados diariamente: comercial, supply chain, marketing, financeiro e diretoria.
+A Energéticos S/A processa 4 milhões de eventos de telemetria por dia vindos de sensores IoT em suas plantas industriais. Quando o time de dados decidiu migrar para a AWS, o primeiro pipeline funcionou em duas semanas. O segundo levou três. No sexto mês, a empresa tinha 23 pipelines em produção, nenhum catálogo unificado e uma média de 9 incidentes silenciosos por semana. Dados duplicados alimentavam dashboards de manutenção preditiva. Ninguém confiava nos números.
 
-O time de dados enfrentava três problemas principais.
+Esse cenário é mais comum do que parece. Organizações escalam pipelines sem escalar as práticas de engenharia que garantem confiabilidade. O resultado é previsível: dívida técnica de dados que cresce exponencialmente. DataOps surge como resposta direta a esse problema. A metodologia aplica automação, qualidade contínua, observabilidade e entrega controlada ao ciclo de vida dos dados, transformando pipelines artesanais em sistemas industrializados.
 
-**Primeiro**, os dados de PDV chegavam de sistemas diferentes, em formatos diferentes, com horários variáveis e sem garantia de completude. Em várias ocasiões, uma rede inteira deixava de enviar dados e o problema só era percebido dias depois, quando algum indicador não fechava.
+Este artigo usa o caso da Energéticos S/A como fio condutor para apresentar uma implementação concreta de DataOps na AWS. Vamos percorrer os 4 quality gates, a linguagem DQDL para regras declarativas, o CI/CD de pipelines, a orquestração com Step Functions usando Choice e Catch, a observabilidade em 3 planos e o processo de quarentena. Cada componente foi efetivamente provisionado em uma conta AWS real — as imagens ao longo do artigo são capturas do ambiente em operação. O objetivo é fornecer um guia prático para quem já opera na AWS e quer elevar a maturidade operacional dos seus dados.
 
-**Segundo**, erros de classificação fiscal e produto chegavam ao data lake e eram propagados para relatórios oficiais. O problema não era apenas técnico: dado errado podia virar risco regulatório, retrabalho e perda de confiança.
+A Energéticos S/A é um caso ilustrativo que dá contexto de negócio aos conceitos. O ambiente AWS apresentado nas capturas a seguir é a prova de conceito que implementa e valida cada mecanismo descrito — quality gates, DQDL, CI/CD, observabilidade e quarentena — de forma reproduzível.
 
-**Terceiro**, havia pressão por velocidade. Comercial queria dashboards atualizados em D+1 às 9h. Marketing queria cohort analysis no mesmo dia. Supply chain queria dados confiáveis para reposição. Pipeline batch que falha silenciosamente não sustenta esse nível de operação.
+## O Caso Energéticos S/A
 
-A meta da iniciativa de DataOps foi clara:
+A Energéticos S/A é uma indústria de bebidas energéticas com 3 plantas no Brasil. Sensores em linhas de produção emitem eventos a cada 5 segundos: temperatura, pressão, velocidade da esteira e volume de envase. Esses dados alimentam modelos de manutenção preditiva e dashboards operacionais em tempo real.
 
-> reduzir o tempo médio de detecção de problemas em dados de dias para minutos, bloquear propagação de dados ruins e dar visibilidade explícita do que está rodando, falhando ou atrasado — sem depender de alguém abrir o console da AWS.
+### O problema antes de DataOps
 
----
+O pipeline original era simples: Kinesis Data Streams capturava os eventos, um Glue Job transformava e gravava no S3, e o Athena servia as consultas. Funcionava até não funcionar. Sensores defeituosos enviavam temperaturas de -999°C. Mudanças de firmware alteravam o schema sem aviso. Jobs falhavam às 3h da manhã e ninguém percebia até o turno da manhã.
 
-## Por que Glue ETL puro não basta
+O impacto era concreto. Em um incidente, dados de pressão corrompidos passaram despercebidos por 72 horas. O modelo de manutenção preditiva recomendou troca de válvulas que estavam em perfeito estado. Custo: R$ 180 mil em peças desnecessárias e 14 horas de parada de linha.
 
-A primeira versão do pipeline era a clássica: Glue Jobs em PySpark, S3 particionado e Athena por cima. Funcionava, até deixar de funcionar.
+### A decisão
 
-O problema não era o Glue. O problema era achar que um job ETL bem escrito resolve tudo.
+O time de dados decidiu implementar DataOps com foco em quatro frentes: quality gates automatizados em cada camada do lake, CI/CD para todo código de pipeline, orquestração resiliente com tratamento explícito de falhas e observabilidade que respondesse "o que quebrou, por que e qual o impacto" em menos de 5 minutos.
 
-**Schema drift silencioso.** Uma origem começou a mandar `valor_unitario` como texto com vírgula em vez de ponto decimal. O processamento não quebrou de forma clara. Parte dos dados foi convertida, parte virou nulo, parte passou com comportamento inesperado. O dashboard continuou existindo, mas deixou de ser confiável.
+## Os 4 Quality Gates
 
-**Testes de código não validavam dados reais.** O time tinha testes em datasets controlados, mas isso não garantia que os arquivos reais de produção estavam completos, coerentes e dentro do comportamento esperado.
+Quality gates são pontos de verificação obrigatórios que os dados precisam atravessar antes de avançar para a próxima camada do lake. Na Energéticos S/A, cada gate tem regras específicas, critérios de aprovação e ações de remediação definidas. Pense neles como checkpoints de alfândega: o dado só passa se estiver em conformidade.
 
-**Alertas eram binários.** O CloudWatch avisava quando um job falhava. Mas não avisava quando o job terminava com sucesso processando 30% menos linhas que ontem. Sucesso aparente é o pior tipo de falha.
+A escolha de quatro gates não é arbitrária. Cada gate captura uma classe distinta de problema, e cada classe exige um instrumento diferente. Um único gate "valida tudo" no fim do pipeline é tarde demais — quando o dado ruim chega ao Gold, ele já consumiu processamento e já contaminou tabelas intermediárias. Validar cedo e em camadas é o que torna o custo de um problema proporcional à profundidade em que ele é detectado.
 
-A solução não é “escrever mais PySpark”. A solução é desenhar um sistema de dados com portões de qualidade, observabilidade, governança e CI/CD.
+### Gate 1: Ingestão (Raw)
 
----
+O primeiro gate valida os dados no momento em que chegam ao S3. As verificações são estruturais: o arquivo está no formato esperado? O schema contém os campos obrigatórios? O tamanho do arquivo está dentro da faixa normal?
 
-## Arquitetura medallion com quatro portões de qualidade
+Regras típicas deste gate:
 
-A arquitetura segue o padrão medallion, mas com uma diferença importante: **Raw é imutável**.
+    - Arquivo deve ser JSON Lines válido
+    - Campos obrigatórios: sensor_id, timestamp, metric_type, value
+    - Tamanho do arquivo entre 1 KB e 500 MB
+    - Timestamp não pode ser futuro (tolerância de 5 minutos)
 
-O dado original sempre é persistido primeiro. Mesmo dado ruim precisa existir para auditoria, reprocessamento e rastreabilidade. Os gates não bloqueiam a chegada do dado bruto; eles bloqueiam a promoção para as próximas camadas.
+Se o arquivo falha no Gate 1, ele é movido para a zona de quarentena com metadados do motivo da rejeição. Nenhum processamento downstream acontece.
 
-Fluxo conceitual:
+### Gate 2: Conformidade (Bronze para Silver)
 
-```text
-Input
-  │
-  ▼
-Raw imutável no S3
-  │
-  ▼
-Profile Gate
-  │
-  ├── reprovou ──► Quarentena + alerta
-  │
-  ▼
-Bronze
-  │
-  ▼
-Quality Gate 1 — regras de negócio
-  │
-  ├── reprovou ──► Quarentena + alerta
-  │
-  ▼
-Silver
-  │
-  ▼
-Quality Gate 2 — Glue Data Quality / DQDL
-  │
-  ├── reprovou ──► Quarentena + alerta
-  │
-  ▼
-Gold
-  │
-  ▼
-Business Gate — validação semântica de KPIs
-  │
-  ├── desvio relevante ──► alerta executivo
-  │
-  ▼
-Athena / QuickSight / consumo analítico
+O segundo gate aplica regras de domínio aos dados já parseados. Aqui entram validações de negócio: a temperatura está dentro da faixa operacional? O sensor_id existe no cadastro? A frequência de eventos está dentro do esperado?
+
+Regras típicas deste gate:
+
+    - Temperatura entre -40°C e 150°C
+    - Pressão entre 0 e 25 bar
+    - sensor_id deve existir na tabela de referência dim_sensores
+    - Completude mínima de 95% para campos obrigatórios
+
+Dados que falham no Gate 2 são segregados com flag de não-conformidade. O pipeline continua processando os dados válidos.
+
+### Gate 3: Consistência (Silver para Gold)
+
+O terceiro gate verifica a consistência dos dados agregados. Após as transformações, os números fazem sentido? Existem duplicatas? As métricas derivadas estão dentro de limites estatísticos?
+
+Regras típicas deste gate:
+
+    - Unicidade de chave composta (sensor_id + timestamp + metric_type)
+    - Variação máxima de 3 desvios-padrão em relação à média móvel de 7 dias
+    - Volume de registros não pode cair mais de 30% em relação ao dia anterior
+    - Soma de produção por planta deve ser positiva
+
+### Gate 4: Entrega (Gold para Consumo)
+
+O quarto gate valida os dados antes de disponibilizá-los para consumidores finais: dashboards, modelos de ML e APIs. Este gate verifica freshness (atualidade dos dados), completude de dimensões e integridade referencial.
+
+Regras típicas deste gate:
+
+    - Freshness: dados não podem ter mais de 2 horas de atraso
+    - Todas as plantas devem ter dados no período (sem gaps)
+    - Integridade referencial com dimensões (produto, planta, turno)
+    - Score de qualidade geral acima de 92%
+
+## DQDL: Regras Declarativas de Qualidade
+
+DQDL (Data Quality Definition Language) é a linguagem declarativa do AWS Glue Data Quality para expressar regras de validação. Em vez de escrever código imperativo para cada verificação, você declara o que espera dos dados e o serviço avalia automaticamente. O AWS Glue Data Quality é construído sobre o framework open-source DeeQu, oferecendo uma experiência gerenciada e serverless — sem instalação, patching ou manutenção.
+
+Na Energéticos, as regras DQDL são avaliadas dentro do próprio Glue Job de ETL: a mesma execução que transforma os dados também aplica os quality gates, evitando uma passada extra de leitura. O job roda em Glue 4.0 (Spark 3.3, Python 3) com a opção de geração de insights habilitada, o que permite ao serviço analisar execuções e sugerir otimizações.
+
+![Glue Job de ETL configurado com Data Quality](img/03-glue-job-details.png)
+*O Glue Job `dataops-demo-dev-etl-job` com Data Quality integrado: transformação e avaliação de qualidade na mesma execução, com role IAM dedicada e job insights ativo.*
+
+### Anatomia de uma regra DQDL
+
+Um documento DQDL é case-sensitive e contém um ruleset — uma lista chamada `Rules` (capitalizada), delimitada por colchetes, com regras separadas por vírgula. Cada regra segue a estrutura: tipo de verificação, coluna alvo e condição esperada. O Glue Data Quality avalia cada regra e retorna um score de qualidade entre 0 e 1, calculado como o percentual de regras que passam. Veja como as regras do Gate 2 da Energéticos ficam em DQDL:
+
+    Rules = [
+        Completeness "sensor_id" >= 0.99,
+        Completeness "timestamp" >= 0.99,
+        Completeness "value" >= 0.95,
+        ColumnValues "temperature" between -40 and 150,
+        ColumnValues "pressure" between 0 and 25,
+        Uniqueness "event_id" >= 0.98,
+        ColumnLength "sensor_id" = 12,
+        IsComplete "metric_type",
+        ColumnValues "metric_type" in ["temperature", "pressure", "speed", "volume"],
+        ReferentialIntegrity "sensor_id" "dim_sensores.sensor_id" = 1.0
+    ]
+
+Um detalhe de sintaxe que merece atenção: na regra `ReferentialIntegrity`, o segundo parâmetro usa a notação `"Alias.coluna"`, onde `Alias` referencia a tabela de referência configurada no job — não o nome literal da tabela. A regra `ReferentialIntegrity` é avaliada em jobs ETL e suporta verificação de relacionamento entre datasets distintos. O operador `= 1.0` exige integridade total (100% dos `sensor_id` presentes na dimensão); um threshold como `>= 0.97` toleraria até 3% de órfãos.
+
+### Tipos de regra mais usados
+
+O DQDL oferece atualmente 27 tipos de regra que cobrem os cenários mais comuns de qualidade de dados industriais:
+
+| Tipo de Regra | O que verifica | Exemplo |
+|---|---|---|
+| Completeness | Percentual de valores não-nulos | Completeness "sensor_id" >= 0.99 |
+| Uniqueness | Percentual de valores únicos | Uniqueness "event_id" >= 0.98 |
+| ColumnValues | Valores dentro de faixa ou lista | ColumnValues "temperature" between -40 and 150 |
+| ColumnLength | Comprimento fixo ou faixa de caracteres | ColumnLength "sensor_id" = 12 |
+| IsComplete | Campo 100% preenchido (sem nulos) | IsComplete "metric_type" |
+| ReferentialIntegrity | Integridade referencial entre tabelas | ReferentialIntegrity "sensor_id" "ref.sensor_id" = 1.0 |
+| RowCount | Volume de registros esperado | RowCount >= 10000 |
+| CustomSql | Validação via SQL customizado | CustomSql "SELECT COUNT(*) FROM primary WHERE value < 0" = 0 |
+
+### Anomaly detection: quando você não conhece o threshold
+
+Regras estáticas têm uma fraqueza estrutural: thresholds envelhecem. Um exemplo clássico documentado pela AWS — um engenheiro de dados de uma varejista define que vendas diárias devem superar US$ 1 milhão. Meses depois, as vendas passam de US$ 2 milhões e o threshold fica obsoleto. Quando um pipeline de extração falha silenciosamente e as vendas caem 25%, a regra desatualizada continua passando, e o problema só é descoberto depois de horas de investigação.
+
+A resposta do Glue Data Quality para isso são os **Analyzers** e a regra **DetectAnomalies**. Analyzers coletam estatísticas (RowCount, Completeness, DistinctValuesCount, Mean, StandardDeviation, entre outras) sem aplicar nenhuma condição fixa. Ao longo das execuções, o serviço armazena essas estatísticas e, com um mínimo de três pontos de dados, um algoritmo de machine learning aprende a tendência — inclusive sazonalidade — e prevê faixas esperadas com limites superior e inferior. Quando o valor real rompe esses limites, uma Observação de anomalia é gerada.
+
+Na Energéticos, o Gate 3 combina regras determinísticas com analyzers para volume de eventos por planta:
+
+    Rules = [
+        RowCount > 1000,
+        DetectAnomalies "RowCount"
+    ]
+    Analyzers = [
+        RowCount,
+        DistinctValuesCount "sensor_id"
+    ]
+
+Existe ainda uma terceira opção, as **Dynamic Rules**, suportadas em jobs Glue ETL, que permitem thresholds calculados em tempo de execução — por exemplo `RowCount > avg(last(10))`, que exige que a contagem atual supere a média das dez execuções anteriores. É o meio-termo entre o threshold fixo e o ML de anomaly detection.
+
+### Vantagens da abordagem declarativa
+
+A abordagem declarativa do DQDL traz três benefícios diretos. Primeiro, as regras são legíveis por analistas de negócio, não apenas por engenheiros. Segundo, o versionamento é trivial porque as regras são texto puro. Terceiro, o Glue Data Quality gera métricas históricas automaticamente, permitindo acompanhar a evolução da qualidade ao longo do tempo.
+
+Na Energéticos, o time de qualidade industrial define as regras de negócio em linguagem natural. O engenheiro de dados traduz para DQDL. Ambos revisam juntos. Esse processo colaborativo eliminou 80% dos falsos positivos que existiam quando as regras eram hardcoded em scripts Python.
+
+Vale conhecer os limites do serviço para dimensionar bem: um ruleset suporta até 2.000 regras e tem tamanho máximo de 65 KB — rulesets maiores devem ser divididos. As estatísticas coletadas têm limite de 100.000 por conta e retenção de até dois anos. Em custo, o Glue Data Quality cobra por DPU consumido durante a avaliação, na mesma tarifa de um Glue Job equivalente (na ordem de US$ 0,44 por DPU-hora), e a detecção de anomalias consome aproximadamente 1 DPU por estatística analisada — um motivo para habilitar anomaly detection apenas em tabelas de alto valor.
+
+![Regras DQDL configuradas no AWS Glue Data Quality](img/04-dqdl-rules.png)
+*Regras DQDL avaliadas no pipeline da Energéticos. O score de qualidade alimenta o estado Choice do Step Functions.*
+
+## CI/CD para Pipelines de Dados
+
+Na Energéticos S/A, todo código de pipeline passa por um fluxo de CI/CD antes de chegar à produção. Isso inclui Glue Jobs, regras DQDL, definições de Step Functions e scripts de infraestrutura. A premissa é simples: se o código muda, ele precisa ser testado antes de tocar dados reais.
+
+CI/CD é o pilar que distingue DataOps de "ETL agendado". Sem ele, cada alteração de uma regra de qualidade ou de uma transformação é uma edição manual no console, sem revisão, sem histórico, sem rollback. Com ele, o pipeline de dados ganha as mesmas garantias de um sistema de software: rastreabilidade de cada mudança, revisão por pares, e a capacidade de reverter para um estado conhecido.
+
+### Estrutura do repositório
+
+O repositório segue uma estrutura que separa claramente código de transformação, regras de qualidade e infraestrutura:
+
+```
+pipeline-energeticos/
+  glue-jobs/
+    raw_to_bronze.py
+    bronze_to_silver.py
+    silver_to_gold.py
+  quality-rules/
+    gate1_ingestao.dqdl
+    gate2_conformidade.dqdl
+    gate3_consistencia.dqdl
+    gate4_entrega.dqdl
+  stepfunctions/
+    pipeline_definition.asl.json
+  cfn/
+    infrastructure.yaml
+  tests/
+    test_transformations.py
+    test_quality_rules.py
 ```
 
-A decisão de usar quatro portões é deliberada:
+![Repositório CodeCommit com o template do pipeline DataOps](img/09-codecommit-main.png)
+*Branch `main` do repositório, com o template versionado. Cada push dispara o pipeline de CI/CD.*
 
-- **Profile Gate** identifica problemas estruturais e volumétricos.
-- **Quality Gate 1** valida regras de negócio.
-- **Quality Gate 2** valida qualidade contínua usando DQDL.
-- **Business Gate** compara KPIs com comportamento histórico e identifica desvios semanticamente suspeitos.
+> **Nota sobre o repositório de código.** Esta implementação usa AWS CodeCommit como repositório Git. É importante o contexto: em julho de 2024 a AWS deixou de aceitar novos clientes no CodeCommit, recomendando GitHub, GitLab ou outros provedores. Em novembro de 2025, após retorno de feedback de clientes — especialmente de setores regulados que valorizam a integração nativa com IAM, VPC endpoints e CloudTrail —, a AWS reverteu a decisão e o CodeCommit voltou à disponibilidade geral completa, com inscrições de novos clientes reabertas. Para times que preferem outro provedor, todo o fluxo descrito aqui funciona de forma equivalente com **AWS CodeConnections** (antiga CodeStar Connections) integrando GitHub ou GitLab ao CodePipeline — a arquitetura de CI/CD não muda, apenas a origem do código.
 
-Esse último ponto é crucial: o dado pode estar tecnicamente correto e ainda assim estar errado para o negócio.
+### Arquitetura CI/CD Cross-Region
 
----
+O pipeline de CI/CD da Energéticos opera cross-region: o código vive em us-east-1 (desenvolvimento) e o deploy de produção acontece em sa-east-1 (São Paulo, mais próximo das plantas industriais). Essa separação garante que o ambiente de desenvolvimento nunca interfira na produção, e que os dados de produção fiquem na região com menor latência para os consumidores.
 
-## Profiling: útil, mas não como muleta
+> **Nota:** A fim de demonstração, utilizamos duas regiões distintas (us-east-1 e sa-east-1) para simular o cenário cross-region. Em produção, a escolha de regiões depende dos requisitos de latência, compliance e disaster recovery de cada organização.
 
-Profiling pode ser usado para discovery, principalmente em cenários em que o time precisa entender rapidamente padrões, nulos, distribuições e anomalias iniciais nos datasets.
-
-Mas, em uma arquitetura DataOps enterprise, profiling não deve ser tratado como única peça de qualidade.
-
-A recomendação para a Energéticos/SA foi:
-
-- usar profiling para entender comportamento dos dados;
-- usar regras versionadas e automatizadas para validação contínua;
-- manter AWS Glue Data Quality como engine principal para qualidade operacional;
-- nunca depender de inspeção visual como etapa obrigatória de produção.
-
-O profiling ajuda a descobrir o problema. O DataOps precisa impedir que ele se propague.
-
----
-
-## Glue Data Quality e DQDL: qualidade como código
-
-O AWS Glue Data Quality permite definir regras de qualidade com DQDL, uma linguagem declarativa para validar datasets.
-
-Exemplo simplificado:
-
-```text
-Rules = [
-  ColumnExists "id_transacao",
-  IsComplete "id_transacao",
-  IsComplete "id_loja",
-  ColumnValues "canal" in ["LOJA","MARKETPLACE","B2B"],
-  RowCount > 5000,
-  Uniqueness "id_transacao" > 0.99,
-  Mean "valor_total" between 30 and 500
-]
+```
+┌─────────────────── us-east-1 (DEV) ───────────────────┐
+│                                                         │
+│  CodeCommit          CodePipeline         CodeBuild     │
+│  (branch main) ──→  (Source) ──→  (Build & Deploy)     │
+│                                         │               │
+└─────────────────────────────────────────│───────────────┘
+                                          │
+                                          │ aws cloudformation deploy
+                                          │ --region sa-east-1
+                                          ▼
+┌─────────────────── sa-east-1 (PROD) ──────────────────┐
+│                                                         │
+│  CloudFormation Stack: dataops-demo-prod                │
+│  ├── S3 Buckets (raw, processed, scripts)              │
+│  ├── Glue Job (ETL com Data Quality)                   │
+│  ├── Step Functions (orquestração)                     │
+│  ├── SNS (alertas)                                     │
+│  └── CloudWatch Alarms (observabilidade)               │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
 ```
 
-A vantagem é que a regra deixa de estar escondida em código procedural e passa a ser um contrato explícito da tabela.
+### Fluxo de CI/CD com CodePipeline + CodeBuild
 
-Na Energéticos/SA, cada dataset crítico tem seu conjunto de regras versionado junto ao repositório do pipeline. Mudou a regra? Passa por pull request. Passa por validação. Gera histórico. Entra no deploy controlado.
+O fluxo de entrega contínua usa CodePipeline com dois estágios e um buildspec inline que executa validação e deploy:
 
-Isso é DataOps: qualidade como código.
+**Estágio 1 — Source:** O CodePipeline monitora a branch `main` do CodeCommit via EventBridge. Qualquer push dispara automaticamente o pipeline.
 
----
+**Estágio 2 — Build & Deploy:** O CodeBuild executa três fases sequenciais:
 
-## CI/CD completo para DataOps na AWS
-
-Sem CI/CD, DataOps fica incompleto.
-
-O pipeline de CI/CD da Energéticos/SA foi desenhado para tratar dados como produto de software. Não basta fazer deploy de script Glue; é necessário promover a solução inteira com segurança.
-
-O fluxo proposto:
-
-```text
-Developer
-  │
-  ▼
-GitHub Pull Request
-  │
-  ▼
-Validação automática
-  ├── lint de CloudFormation
-  ├── validação de templates
-  ├── testes unitários de jobs Glue
-  ├── validação de DQDL
-  ├── checagem de segurança/IAM
-  └── empacotamento dos artefatos
-  │
-  ▼
-Merge na branch principal
-  │
-  ▼
-AWS CodePipeline
-  │
-  ▼
-CodeBuild — Build & Validate
-  │
-  ▼
-CloudFormation Change Set — DEV
-  │
-  ▼
-Deploy DEV
-  │
-  ▼
-Testes pós-deploy
-  │
-  ▼
-Aprovação manual
-  │
-  ▼
-CloudFormation Change Set — HML/PRD
-  │
-  ▼
-Deploy controlado
+```yaml
+# buildspec.yml (inline no template CloudFormation)
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - echo "VALIDANDO TEMPLATE CLOUDFORMATION"
+      - aws cloudformation validate-template \
+          --template-body file://$CODEBUILD_SRC_DIR/$TEMPLATE_FILE \
+          --region $DEPLOY_REGION
+      - echo "Template validado com sucesso!"
+  build:
+    commands:
+      - echo "DEPLOY CROSS-REGION para $DEPLOY_REGION"
+      - aws cloudformation deploy \
+          --template-file $CODEBUILD_SRC_DIR/$TEMPLATE_FILE \
+          --stack-name $STACK_NAME \
+          --region $DEPLOY_REGION \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameter-overrides Environment=prod AlertEmail=$ALERT_EMAIL \
+          --no-fail-on-empty-changeset
+  post_build:
+    commands:
+      - aws cloudformation describe-stacks \
+          --stack-name $STACK_NAME --region $DEPLOY_REGION \
+          --query "Stacks[0].StackStatus" --output text
+      - echo "Pipeline CI/CD cross-region concluído!"
 ```
 
-O CI/CD cobre:
+O `--no-fail-on-empty-changeset` é importante: se o template não mudou, o pipeline não falha — simplesmente reporta que não há alterações. Isso evita falsos negativos quando apenas scripts Glue são atualizados sem mudança na infraestrutura.
 
-- infraestrutura como código;
-- versionamento dos scripts Glue;
-- versionamento das regras DQDL;
-- versionamento dos workflows Step Functions;
-- validação automática antes do deploy;
-- promoção entre ambientes;
-- trilha de auditoria;
-- possibilidade de rollback por versão.
+![Fases do build no AWS CodeBuild](img/11-codebuild-fases.png)
+*As 11 fases do CodeBuild, de SUBMITTED a COMPLETED, todas com status "Com êxito". A fase BUILD executa o deploy cross-region.*
 
-Esse é um ponto essencial: DataOps não é só orquestrar dados. É controlar mudança.
+![Log do CodeBuild confirmando o deploy cross-region](img/12-codebuild-log.png)
+*Log de execução: o template é validado, o deploy cross-region é aplicado e o stack chega a UPDATE_COMPLETE.*
 
----
+### IAM Cross-Region: o desafio real
 
-## Step Functions com Choice + Catch: orquestração que sabe parar
+O maior desafio do CI/CD cross-region é a configuração de IAM. O CodeBuild em us-east-1 precisa de permissões para criar e gerenciar recursos em sa-east-1. Na Energéticos, a role do CodeBuild tem policies separadas:
 
-A orquestração precisa fazer mais do que executar tarefas em sequência.
+- **Policy base:** logs no CloudWatch e acesso ao bucket de artefatos (us-east-1)
+- **Policy cross-region:** CloudFormation, S3, Glue, Step Functions, SNS, CloudWatch e IAM em sa-east-1
 
-No desenho da Energéticos/SA, cada gate retorna uma decisão:
+A separação em duas policies facilita a auditoria: a equipe de segurança revisa a policy cross-region separadamente, e qualquer mudança de escopo é detectada no diff do template.
 
-```json
-{
-  "passed": true,
-  "reason": "dataset aprovado"
-}
+### Trigger automático via EventBridge
+
+O pipeline não usa polling. Uma regra EventBridge monitora eventos de mudança de estado no CodeCommit e dispara o CodePipeline automaticamente. Isso reduz a latência entre commit e deploy de minutos (polling a cada 1 min) para segundos.
+
+```yaml
+EventPattern:
+  source: [aws.codecommit]
+  detail-type: ["CodeCommit Repository State Change"]
+  detail:
+    event: [referenceCreated, referenceUpdated]
+    referenceType: [branch]
+    referenceName: [main]
 ```
 
-ou
+![Commit registrado no CodeCommit](img/10-codecommit-commit.png)
+*Detalhe de um commit: autoria, mensagem ("feat: adiciona quality gates DQDL e testes unitarios") e ID. O evento referenceUpdated dispara o pipeline.*
 
-```json
-{
-  "passed": false,
-  "reason": "volume abaixo da média esperada"
-}
-```
+### Testes com dados sintéticos
 
-O Step Functions usa estados `Choice` para decidir se promove o dado ou se envia para quarentena. Cada task também tem `Catch`, para capturar falhas técnicas e acionar notificação.
+O segredo do CI/CD para dados é ter datasets de teste que representem cenários reais. Na Energéticos, o time mantém 4 datasets sintéticos:
 
-Isso evita o maior erro de pipelines de dados: continuar rodando mesmo quando já deveria ter parado.
+| Dataset | Propósito | Características |
+|---|---|---|
+| happy_path.json | Validar fluxo normal | 1000 eventos válidos, todos os sensores |
+| schema_drift.json | Testar resiliência a mudanças | Campos extras, campos faltando, tipos alterados |
+| outliers.json | Validar quality gates | Temperaturas extremas, pressões negativas, timestamps futuros |
+| volume_spike.json | Testar escalabilidade | 100x o volume normal em uma janela de 5 minutos |
+
+Cada push no repositório executa a suíte de testes contra esses datasets. Se qualquer quality gate rejeitar dados do happy_path ou aceitar dados do outliers, o pipeline de CI/CD falha e o merge é bloqueado. A suíte usa pytest com a biblioteca hypothesis para property-based testing — em vez de só verificar exemplos fixos, ela gera variações dos dados e confirma que as invariantes do pipeline se mantêm.
+
+![Execução da suíte de testes unitários](img/13-testes-unitarios.png)
+*32 testes cobrindo os 4 quality gates (ingestão, conformidade, consistência, entrega) e as transformações Raw→Bronze→Silver→Gold. Todos aprovados antes do deploy.*
+
+## Orquestração com Step Functions: Choice e Catch
+
+A orquestração do pipeline da Energéticos usa AWS Step Functions com dois padrões fundamentais: Choice para roteamento condicional baseado em resultados de qualidade, e Catch para tratamento resiliente de falhas.
+
+### Por que Step Functions
+
+Step Functions oferece três características essenciais para DataOps. Primeiro, a máquina de estados é visual e auditável, qualquer pessoa consegue entender o fluxo olhando o diagrama. Segundo, o histórico de execuções é mantido automaticamente, facilitando troubleshooting. Terceiro, o modelo de retry e catch é declarativo, sem código boilerplate de tratamento de exceções.
+
+### O padrão Choice: roteamento por qualidade
+
+Após cada quality gate, um estado Choice avalia o score de qualidade retornado pelo Glue Data Quality. Dependendo do resultado, o fluxo segue caminhos diferentes:
+
+    [Glue Job: Raw to Bronze]
+        |
+    [Quality Gate 2: Conformidade]
+        |
+    [Choice: Score >= 0.92?]
+       /          \
+     SIM          NÃO
+      |             |
+    [Bronze       [Quarentena +
+     to Silver]    Notificação]
+
+O estado Choice avalia a variável `$.qualityScore` retornada pelo Glue Data Quality. Se o score é maior ou igual a 0.92, o pipeline avança normalmente. Se é menor, os dados são direcionados para quarentena e o time recebe notificação via SNS.
+
+### O padrão Catch: resiliência a falhas
+
+Cada estado do Step Functions tem um bloco Catch que captura erros específicos e direciona para tratamento adequado. Na Energéticos, o Catch diferencia entre erros transitórios (que merecem retry) e erros permanentes (que exigem intervenção humana):
+
+    Estratégia de Catch por tipo de erro:
+
+    Glue Job Timeout (transitório)
+      -> Retry com backoff exponencial: 30s, 60s, 120s
+      -> Após 3 tentativas: notifica equipe + pausa pipeline
+
+    Glue Job Exception (permanente)
+      -> Captura erro no estado "HandleFailure"
+      -> Registra detalhes no DynamoDB (tabela pipeline_incidents)
+      -> Notifica equipe via SNS com contexto do erro
+      -> Move dados para quarentena
+
+    Quality Gate Failure (condicional)
+      -> Choice avalia severidade do score
+      -> Score entre 0.85 e 0.92: warning, pipeline continua com flag
+      -> Score abaixo de 0.85: pipeline para, dados em quarentena
+
+### Combinando Choice e Catch
+
+O poder real aparece quando Choice e Catch trabalham juntos. O Choice lida com decisões de negócio (qualidade suficiente ou não). O Catch lida com falhas técnicas (timeout, exceção, serviço indisponível). Juntos, cobrem tanto o cenário "dados ruins" quanto o cenário "infraestrutura com problema".
+
+![Step Functions com Choice e Catch em execução](img/05-stepfunctions-pipeline.png)
+*Máquina de estados em execução: o estado StartGlueJob conclui com sucesso (verde), o Catch #1 protege contra falhas roteando para NotifyFailure, e o fluxo chega a JobSucceeded.*
+
+Na prática, a Energéticos tem um Step Functions com 14 estados: 4 Glue Jobs (um por camada), 4 Quality Gates, 3 estados Choice (gates 2, 3 e 4), 2 estados de tratamento de falha e 1 estado final de notificação de sucesso.
+
+## Observabilidade em 3 Planos
+
+Observabilidade em DataOps vai além de "o job rodou ou não". Na Energéticos, a equipe implementou observabilidade em três planos complementares: infraestrutura, pipeline e dados. Cada plano responde perguntas diferentes, tem público diferente e usa ferramentas diferentes. Essa separação é deliberada: o analista de negócio não quer ver duração de Glue Job, e o engenheiro de plantão não quer abrir um dashboard de KPI para descobrir que um job travou.
+
+### Plano 1: Infraestrutura
+
+O plano de infraestrutura monitora os recursos computacionais que sustentam o pipeline. As perguntas que este plano responde são: os jobs estão consumindo recursos dentro do esperado? Existe throttling? A capacidade provisionada é suficiente?
+
+| Métrica | Serviço | Alarme |
+|---|---|---|
+| Duração do Glue Job | CloudWatch Metrics | > 2x a média histórica |
+| DPU utilizado vs alocado | CloudWatch Metrics | Utilização > 90% por 15 min |
+| Erros de API (throttling) | CloudTrail + CloudWatch | > 5 throttles em 1 minuto |
+| Tamanho da fila Kinesis | CloudWatch Metrics | Iterator age > 5 minutos |
+| Lambda concurrent executions | CloudWatch Metrics | > 80% do limite da conta |
+
+### Plano 2: Pipeline
+
+O plano de pipeline monitora o fluxo de execução end-to-end. As perguntas são: o pipeline executou no horário? Todas as etapas completaram? O SLA de entrega foi cumprido?
+
+| Métrica | Serviço | Alarme |
+|---|---|---|
+| Status da execução Step Functions | CloudWatch Events | Qualquer execução com status FAILED |
+| Latência end-to-end | CloudWatch Custom Metric | > 45 minutos (SLA é 1 hora) |
+| Jobs em fila aguardando | CloudWatch Metrics | > 3 jobs pendentes |
+| Frequência de retries | CloudWatch Logs Insights | > 2 retries por execução |
+| Tempo entre ingestão e disponibilidade | Custom Metric | > 2 horas (freshness SLA) |
+
+### Plano 3: Dados
+
+O plano de dados monitora a qualidade e o comportamento dos dados em si. As perguntas são: os dados estão corretos? O volume está dentro do esperado? Existem anomalias estatísticas?
+
+| Métrica | Serviço | Alarme |
+|---|---|---|
+| Score de qualidade por gate | Glue Data Quality + CloudWatch | Score < 0.92 |
+| Volume de registros por hora | CloudWatch Custom Metric | Queda > 30% vs média 7 dias |
+| Taxa de quarentena | Custom Metric | > 5% dos registros em quarentena |
+| Drift de schema detectado | Glue Schema Registry | Qualquer alteração não-planejada |
+| Freshness dos dados Gold | Custom Metric | Dados com mais de 2 horas de atraso |
+
+### Dashboard unificado
+
+Os três planos convergem em um dashboard CloudWatch que a equipe da Energéticos consulta diariamente. O dashboard agrega métricas de Step Functions (execuções e duração), Glue Job (tasks completadas vs falhas, bytes lidos e records escritos), SNS (notificações publicadas e entregues) e um painel de Quality Gate que resume o score de qualidade contra o threshold definido.
+
+![Dashboard CloudWatch unificado do pipeline DataOps](img/14-cloudwatch-dashboard.png)
+*Dashboard DataOps-Pipeline-Monitor: execuções e duração do Step Functions, métricas do Glue Job, notificações SNS e o painel Quality Gate com o resumo do score.*
+
+O time configurou alarmes compostos (Composite Alarms) que correlacionam métricas dos três planos. Por exemplo: se o volume de dados cai E o Glue Job está com duração normal E não há erros de infraestrutura, o problema provavelmente está na fonte. Essa correlação reduz o tempo de diagnóstico de 45 minutos para menos de 5.
+
+### Alertas com SNS
+
+O Amazon SNS distribui as notificações do pipeline. O modelo de publish/subscribe permite que um único evento — um quality gate que falhou, um Glue Job que estourou timeout — seja entregue simultaneamente a múltiplos endpoints: e-mail da equipe de plantão, um endpoint HTTPS que registra o incidente, e potencialmente SMS para incidentes críticos. O publisher (o estado NotifyFailure do Step Functions) não conhece os subscribers; essa indireção é o que torna o sistema de alertas extensível sem mexer no pipeline.
+
+![Tópico SNS com a assinatura de e-mail confirmada](img/06-sns-topic.png)
+*Tópico `dataops-demo-dev-pipeline-alerts` com assinatura de e-mail confirmada. Cada alerta carrega o contexto do incidente.*
+
+## Processo de Quarentena
+
+Quarentena é o mecanismo que isola dados problemáticos sem interromper o pipeline inteiro. Na Energéticos, dados que falham em qualquer quality gate são movidos para um bucket S3 separado com metadados que explicam o motivo da rejeição.
+
+A separação física das camadas — raw, processed (bronze/silver/gold) e quarentena em buckets distintos — é uma decisão arquitetural importante: garante que dados problemáticos nunca contaminem fisicamente as camadas downstream, mesmo em caso de erro de código no pipeline.
+
+![Buckets S3 do pipeline DataOps](img/02-s3-buckets.png)
+*Os buckets do data lake: raw (ingestão), processed (camadas medallion), scripts, cicd-artifacts e o bucket dedicado de quarentena. A separação física isola cada estágio e impede que dados rejeitados contaminem camadas downstream.*
+
+### Estrutura da quarentena
+
+O bucket de quarentena segue uma estrutura que facilita investigação e reprocessamento:
+
+    s3://dataops-demo-dev-quarantine-235911282620/
+      gate=1/date=2026-05-16/hour=14/
+        file_001.json
+        file_001_metadata.json
+      gate=2/date=2026-05-16/hour=14/
+        batch_042.parquet
+        batch_042_metadata.json
+
+O arquivo de metadados contém informações essenciais para diagnóstico:
+
+    - gate: qual quality gate rejeitou
+    - timestamp: quando a rejeição aconteceu
+    - rules_failed: lista de regras DQDL que falharam
+    - quality_score: score obtido vs score mínimo
+    - sample_violations: 10 registros de exemplo que violaram as regras
+    - source_file: arquivo original que gerou os dados
+    - pipeline_execution_id: ID da execução do Step Functions
+
+![Estrutura interna do bucket de quarentena](img/16-quarentena-estrutura.png)
+*O bucket de quarentena particionado por gate: `gate=1/` e `gate=2/` isolam as rejeições de cada quality gate, facilitando triagem e reprocessamento direcionado.*
+
+### Ciclo de vida da quarentena
+
+Dados em quarentena seguem um ciclo de vida definido com SLAs claros:
+
+1. Detecção: quality gate rejeita e move para quarentena (automático, imediato)
+2. Notificação: SNS alerta o time com contexto do problema (automático, < 1 minuto)
+3. Triagem: engenheiro avalia se é problema de fonte, transformação ou regra (manual, SLA 4 horas)
+4. Correção: fix aplicado na fonte, no job ou na regra (manual, SLA 24 horas)
+5. Reprocessamento: dados corrigidos são reinjetados no pipeline (semi-automático, < 1 hora)
+6. Expiração: dados não reprocessados em 30 dias são movidos para Glacier (automático, via S3 Lifecycle)
+
+![Regra de ciclo de vida do bucket de quarentena](img/15-quarentena-lifecycle.png)
+*Regra S3 Lifecycle `quarentena-glacier-30dias` habilitada: objetos não reprocessados transicionam automaticamente para Glacier Flexible Retrieval no dia 30, reduzindo custo de retenção sem perder os dados para auditoria.*
+
+### Reprocessamento controlado
+
+O reprocessamento não é simplesmente "rodar de novo". Na Energéticos, o Step Functions tem um fluxo separado chamado "ReprocessQuarantine" que:
+
+- Lê os metadados da quarentena para entender o contexto
+- Aplica a correção específica (novo schema, nova regra, dados complementares)
+- Executa os quality gates novamente com as mesmas regras
+- Se aprovado, injeta os dados na camada correta com flag "reprocessed=true"
+- Se reprovado novamente, escala para revisão manual com prioridade alta
+
+Esse processo garantiu que a Energéticos recuperasse 94% dos dados quarentenados dentro de 48 horas, em vez de simplesmente descartá-los.
+
+## A Infraestrutura como Código
+
+Toda a arquitetura descrita — buckets, Glue Job, Step Functions, SNS, alarmes — é provisionada por um único template CloudFormation. Isso garante reprodutibilidade (o ambiente de produção é idêntico ao de homologação), versionamento (cada mudança de infraestrutura passa pelo mesmo CI/CD do código) e capacidade de auditoria (o diff do template mostra exatamente o que mudou).
+
+![Recursos do stack CloudFormation](img/01-cfn-stack-resources.png)
+*Os 12 recursos do stack dataops-demo: Step Functions, Glue Database e Job, IAM Roles, CloudWatch Alarm, SNS Topic e Subscription, CodeCommit Repository e os buckets S3.*
+
+O stack é parametrizado por ambiente (`Environment=dev|prod`), o que permite que o mesmo template gere as duas instâncias sem duplicação de código. O deploy de produção, disparado pelo CodeBuild, chega ao estado `UPDATE_COMPLETE` ao final do pipeline de CI/CD.
+
+## Lições Aprendidas
+
+Após 8 meses operando com DataOps, a Energéticos S/A acumulou aprendizados que transcendem a implementação técnica. Estas lições servem como guia para quem está começando a jornada.
+
+### Lição 1: Comece pelos quality gates, não pela automação
+
+O instinto natural é automatizar primeiro. Mas automatizar um pipeline sem quality gates apenas acelera a propagação de dados ruins. A Energéticos começou implementando o Gate 2 (conformidade) no pipeline mais crítico. Em 2 semanas, descobriu que 12% dos dados de temperatura estavam fora da faixa operacional. Só depois de resolver esse problema é que a automação fez sentido.
+
+### Lição 2: DQDL precisa de ownership compartilhado
+
+Regras de qualidade escritas apenas por engenheiros tendem a ser tecnicamente corretas mas semanticamente incompletas. Na Energéticos, o engenheiro de manutenção sabia que temperatura acima de 85°C em um sensor específico indicava calibração errada, não aquecimento real. Essa regra nunca teria sido escrita sem colaboração entre domínios.
+
+### Lição 3: Quarentena não é lixeira
+
+Nos primeiros meses, o bucket de quarentena cresceu sem controle porque ninguém olhava. O time tratava quarentena como descarte. Quando implementaram o SLA de triagem de 4 horas e o dashboard de "dados em quarentena por idade", a taxa de recuperação subiu de 23% para 94%.
+
+### Lição 4: Observabilidade em 3 planos evita guerra de culpas
+
+Antes dos 3 planos, cada incidente gerava uma discussão: "é problema de infra", "é problema de dados", "é problema do job". Com métricas separadas por plano, o diagnóstico ficou objetivo. O Composite Alarm que correlaciona os planos reduziu o MTTR (tempo médio de recuperação) de 2 horas para 12 minutos.
+
+### Lição 5: CI/CD para dados exige datasets de teste realistas
+
+Os primeiros testes usavam 10 registros perfeitos. Passavam sempre. Em produção, quebravam com dados reais. Quando o time criou os 4 datasets sintéticos (happy path, schema drift, outliers, volume spike), a taxa de incidentes pós-deploy caiu 73%.
+
+### Lição 6: Step Functions com Choice é mais poderoso que if/else em código
+
+A tentação é colocar lógica condicional dentro do Glue Job. Mas isso esconde decisões de negócio dentro de código técnico. Com Choice no Step Functions, a decisão "score abaixo de 0.92 vai para quarentena" é visível no diagrama, auditável no histórico e modificável sem redeploy do job.
+
+### Lição 7: Thresholds estáticos envelhecem — combine com anomaly detection
+
+As primeiras regras DQDL da Energéticos eram todas estáticas. Funcionaram até o volume de produção crescer 40% em um trimestre e os limites de RowCount ficarem obsoletos, deixando passar quedas reais de volume. Migrar as regras de volume e ticket para `DetectAnomalies` com Analyzers eliminou a manutenção manual de thresholds e capturou dois incidentes de ingestão parcial que regras fixas não pegariam.
+
+### Lição 8: Meça antes e depois
+
+A Energéticos mediu 4 KPIs antes de implementar DataOps e continuou medindo depois:
+
+| KPI | Antes | Depois | Melhoria |
+|---|---|---|---|
+| Incidentes silenciosos por semana | 9 | 0.5 | -94% |
+| MTTR (tempo de recuperação) | 2 horas | 12 minutos | -90% |
+| Dados corrompidos em produção | 12% | 0.8% | -93% |
+| Deploys de pipeline por semana | 1 | 8 | +700% |
+
+## Conclusão e Recomendações
+
+DataOps não é um produto que se instala. É uma disciplina que se constrói incrementalmente, gate por gate, métrica por métrica. O caso da Energéticos S/A demonstra que a combinação de quality gates com DQDL, orquestração resiliente com Step Functions, observabilidade em 3 planos, CI/CD versionado e quarentena com SLA transforma pipelines frágeis em sistemas confiáveis.
+
+A AWS oferece os blocos necessários: Glue Data Quality para regras declarativas e detecção de anomalias por ML, Step Functions para orquestração com Choice e Catch, CloudWatch para observabilidade multi-plano, CodePipeline e CodeBuild para CI/CD de dados, e CloudFormation para infraestrutura como código. O diferencial está em como esses serviços são combinados com práticas de engenharia.
+
+### Recomendação 1: Implemente o Gate 2 primeiro
+
+Escolha o pipeline mais crítico e adicione regras DQDL de conformidade. Comece com 5 regras simples: completude dos campos-chave, faixa de valores para métricas numéricas e integridade referencial. Meça quantos dados falham. Esse número vai justificar todo o investimento subsequente.
+
+### Recomendação 2: Adicione Choice ao Step Functions existente
+
+Se você já usa Step Functions, adicione um estado Choice após o Glue Job que avalia o score de qualidade. Direcione dados com score baixo para um bucket de quarentena. Essa única mudança já elimina a propagação silenciosa de dados ruins.
+
+### Recomendação 3: Separe observabilidade em 3 planos
+
+Crie 3 dashboards no CloudWatch: infraestrutura, pipeline e dados. Configure Composite Alarms que correlacionem métricas entre planos. Quando um alarme dispara, o plano afetado indica imediatamente onde investigar.
+
+### Recomendação 4: Trate quarentena como processo, não como lixeira
+
+Defina SLAs para triagem (4 horas) e correção (24 horas). Crie um dashboard que mostre dados em quarentena por idade. Implemente o fluxo de reprocessamento. Dados recuperados são dados que não precisam ser reingeridos da fonte.
+
+### Recomendação 5: CI/CD com datasets que quebram de propósito
+
+Crie pelo menos 3 datasets de teste: um que deve passar em todos os gates, um com anomalias que deve ser quarentenado e um com schema alterado. Se o pipeline de CI/CD não falha com dados ruins, ele não está testando nada.
 
 ---
 
-## Observabilidade em três planos
+## Referências
 
-A observabilidade foi estruturada em três planos.
+As afirmações técnicas deste artigo foram verificadas contra a documentação oficial da AWS. Para aprofundamento:
 
-**Plano 1 — Pipeline.**  
-Perguntas: o pipeline rodou? Quanto tempo demorou? Qual etapa falhou? Quantos registros foram processados?  
-Público: engenharia de dados.
-
-**Plano 2 — Dados.**  
-Perguntas: as colunas estão completas? A cardinalidade mudou? A distribuição está estranha? A regra DQDL passou?  
-Público: analistas e engenharia.
-
-**Plano 3 — Negócio.**  
-Perguntas: a receita de hoje faz sentido? O volume por canal está coerente? A margem caiu por motivo real ou por erro de dado?  
-Público: liderança e áreas de negócio.
-
-Essa separação evita que todo mundo olhe para o mesmo dashboard tentando responder perguntas diferentes.
+1. **AWS Glue Data Quality** — visão geral, conceitos, limites de ruleset e estatísticas: https://docs.aws.amazon.com/glue/latest/dg/glue-data-quality.html
+2. **Data Quality Definition Language (DQDL) reference** — sintaxe, tipos de regra, operadores compostos e analyzers: https://docs.aws.amazon.com/glue/latest/dg/dqdl.html
+3. **Anomaly detection in AWS Glue Data Quality** — Analyzers, DetectAnomalies e o algoritmo de ML: https://docs.aws.amazon.com/glue/latest/dg/data-quality-anomaly-detection.html
+4. **DetectAnomalies rule type** — sintaxe e regras suportadas: https://docs.aws.amazon.com/glue/latest/dg/dqdl-rule-types-DetectAnomalies.html
+5. **AWS::Glue::DataQualityRuleset (CloudFormation)** — propriedades do recurso: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-glue-dataqualityruleset.html
+6. **Evaluating data quality for ETL jobs in AWS Glue** — uso de ReferentialIntegrity com aliases: https://docs.aws.amazon.com/glue/latest/dg/tutorial-data-quality.html
+7. **AWS Step Functions Developer Guide** — estados Choice, Catch e Retry: https://docs.aws.amazon.com/step-functions/latest/dg/concepts-states.html
+8. **AWS CodeCommit returns to General Availability** (nov/2025) — contexto sobre a disponibilidade do serviço: https://aws.amazon.com/blogs/devops/aws-codecommit-returns-to-general-availability/
+9. **Build event-driven data quality pipelines with AWS Glue DataBrew** — padrão de quality gate event-driven: https://aws.amazon.com/blogs/big-data/build-event-driven-data-quality-pipelines-with-aws-glue-databrew/
+10. **Amazon CloudWatch — Composite Alarms** — correlação de alarmes entre planos: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Create_Composite_Alarm.html
 
 ---
 
-## Quarentena não é cemitério de dados
+## Sobre a Autora
 
-Um ponto importante: quarentena não pode ser uma pasta esquecida no S3.
+**Marcela Monteiro Montenegro Gallo**
+Arquiteta de Dados e AI | 9x AWS Certified | 2x Databricks Certified
+Ingram Micro Cloud — AWS Partner
 
-Toda entrada em quarentena precisa ter:
+[LinkedIn](https://www.linkedin.com/in/marcelamontenegro/)
 
-- dataset de origem;
-- data de ingestão;
-- motivo da reprovação;
-- etapa em que falhou;
-- link para logs;
-- status de tratamento;
-- responsável;
-- decisão final: corrigido, reprocessado, descartado ou aceito com exceção.
-
-Sem isso, a quarentena vira só um bucket caro com problema acumulado.
-
----
-
-## Lessons learned
-
-**Não dependa só de schema validation.**  
-Schema pega estrutura. Não pega semântica.
-
-**Não escreva alerta que ninguém lê.**  
-Alerta precisa ser acionável, categorizado e com contexto.
-
-**Não use crawler como contrato de produção.**  
-Crawler é útil para discovery. Em produção, schema precisa ser explícito e versionado.
-
-**Não trate CI/CD como detalhe técnico.**  
-Em DataOps, CI/CD é mecanismo de governança.
-
-**Não deixe regra de qualidade fora do repositório.**  
-Regra fora do Git vira conhecimento tribal.
-
----
-
-## Conclusão
-
-DataOps na AWS bem feito não é “Glue + Step Functions com nome bonito”.
-
-É um conjunto de decisões arquiteturais que transforma pipeline de dados em sistema operável, auditável e confiável:
-
-- Raw imutável;
-- gates explícitos de qualidade;
-- DQDL versionado;
-- orquestração com decisão;
-- quarentena com processo;
-- observabilidade em três planos;
-- CI/CD completo;
-- infraestrutura como código.
-
-O ROI real de DataOps não é apenas velocidade. É confiança operacional.
-
-Sem confiança, todo dashboard é uma aposta com cara de relatório.
